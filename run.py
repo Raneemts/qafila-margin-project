@@ -8,6 +8,11 @@ The grader runs it on a dataset you haven't seen, so never hard-code file names,
 
 from __future__ import annotations
 
+import pyarrow as pa
+from pyiceberg.exceptions import NoSuchTableError
+import csv
+import pandas as pd
+import sqlite3
 import argparse
 import os
 import subprocess
@@ -27,16 +32,78 @@ def get_catalog(warehouse: Path) -> SqlCatalog:
 
 
 def ingest(data_dir: Path, db: Path) -> None:
-    """Step 1: land the sources in DuckDB, schema `raw`, exactly as they arrive.
+    sqlite_path = data_dir / "qafila_oltp.sqlite"
 
-    - From data_dir/qafila_oltp.sqlite: orders, order_items, products, stores.
-    - Every data_dir/suppliers/prices_*.csv, keeping the file name of each row.
+    tables = ["orders", "order_items", "products", "stores"]
 
-    Running this twice must not duplicate anything.
-    """
-    with duckdb.connect(str(db)) as con:  # closes the file before dbt opens it
-        con.sql("CREATE SCHEMA IF NOT EXISTS raw")
-        raise NotImplementedError("Step 1: load the sources into the raw schema")
+    with sqlite3.connect(str(sqlite_path)) as source:
+        with duckdb.connect(str(db)) as con:
+            con.execute("CREATE SCHEMA IF NOT EXISTS raw")
+
+            # Step 1: Load SQLite tables
+            for table in tables:
+                df = pd.read_sql_query(
+                    f"SELECT * FROM {table}",
+                    source
+                )
+
+                con.register("source_df", df)
+
+                con.execute(
+                    f"CREATE OR REPLACE TABLE raw.{table} AS "
+                    "SELECT * FROM source_df"
+                )
+
+                con.unregister("source_df")
+
+                print(f"Loaded {table}: {len(df)} rows")
+
+            # Step 2: Load supplier CSV files
+            supplier_rows = []
+
+            supplier_dir = data_dir / "suppliers"
+
+            for file in sorted(supplier_dir.glob("prices_*.csv")):
+
+                with open(file, "r", encoding="utf-8-sig", newline="") as f:
+                    reader = csv.DictReader(f)
+
+                    for row in reader:
+                        raw_cost = row.get("unit_cost")
+
+                        if raw_cost is None:
+                            raw_cost = row.get("cost_sar")
+
+                        supplier_rows.append({
+                            "source_file": file.name,
+                            "supplier_id": row.get("supplier_id"),
+                            "sku": row.get("sku"),
+                            "valid_from": row.get("valid_from"),
+                            "raw_cost": raw_cost
+                        })
+
+            supplier_df = pd.DataFrame(
+                supplier_rows,
+                columns=[
+                    "source_file",
+                    "supplier_id",
+                    "sku",
+                    "valid_from",
+                    "raw_cost"
+                ]
+            )
+
+            con.register("supplier_df", supplier_df)
+
+            con.execute("""
+                CREATE OR REPLACE TABLE raw.supplier_prices AS
+                SELECT * FROM supplier_df
+            """)
+
+            con.unregister("supplier_df")
+
+            print(f"Loaded supplier prices: {len(supplier_df)} rows")
+
 
 
 def transform(db: Path) -> None:
@@ -52,15 +119,52 @@ def transform(db: Path) -> None:
 
 
 def publish(db: Path, warehouse: Path) -> None:
-    """Step 5: publish three dbt models to Iceberg (see the brief for the exact columns).
-
-        silver.product_cost_history   gold.weekly_margin   quality.price_quarantine
-
-    Update existing tables in place, never drop and recreate them: the table's snapshots are
-    how we see what a number was before the supplier's correction arrived.
-    """
     catalog = get_catalog(warehouse)
-    raise NotImplementedError("Step 5: publish the models to Iceberg")
+
+    models = [
+        ("silver", "product_cost_history"),
+        ("gold", "weekly_margin"),
+        ("quality", "price_quarantine"),
+    ]
+
+    def sorted_rows(table):
+        return sorted(
+            [str(row) for row in table.to_pylist()]
+        )
+
+    with duckdb.connect(str(db)) as con:
+        for namespace, table_name in models:
+            catalog.create_namespace_if_not_exists(namespace)
+
+            arrow_table = con.execute(
+                f"SELECT * FROM {namespace}.{table_name}"
+            ).to_arrow_table()
+
+            identifier = f"{namespace}.{table_name}"
+
+            try:
+                iceberg_table = catalog.load_table(identifier)
+
+                # Compare existing data with new data
+                existing_table = iceberg_table.scan().to_arrow()
+
+                if sorted_rows(existing_table) == sorted_rows(arrow_table):
+                    print(f"No changes: {identifier}")
+
+                else:
+                    # Update without deleting the Iceberg table
+                    iceberg_table.overwrite(arrow_table)
+                    print(f"Updated Iceberg table: {identifier}")
+
+            except NoSuchTableError:
+                # Create table only on the first run
+                iceberg_table = catalog.create_table(
+                    identifier,
+                    schema=arrow_table.schema,
+                )
+
+                iceberg_table.append(arrow_table)
+                print(f"Created Iceberg table: {identifier}")
 
 
 def main() -> None:
